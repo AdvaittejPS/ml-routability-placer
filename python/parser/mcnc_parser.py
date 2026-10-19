@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Robust MCNC YAL parser using block regex.
+"""MCNC YAL parser (repository version).
 
-This version scans MODULE ... ENDMODULE blocks with regex, extracts TYPE,
-DIMENSIONS, and IOLIST contents. It also extracts NET lines elsewhere in the
-file. This should correctly parse the ami33/ami49 files in the MCNC suite.
+Parses MODULE ... ENDMODULE blocks (TYPE, DIMENSIONS, IOLIST) and NETWORK
+sections to extract instances (blocks) and nets.
+
+Outputs a JSON with structure:
+{
+  "instances": [ {name,type,width,height,pins:[{name,type,x,y}, ...]}, ...],
+  "nets": [ {name, pins:[{instance,pin}, ...]}, ...]
+}
+
+Usage:
+  python3 python/parser/mcnc_parser.py -i data/raw/ami33.yal -o data/processed/ami33.json
 """
 
 import argparse
@@ -73,23 +81,41 @@ def parse_modules(text: str) -> List[Dict[str, Any]]:
     return modules
 
 
-def parse_nets(text: str) -> List[Dict[str, Any]]:
+def parse_networks(text: str, instance_names: set) -> List[Dict[str, Any]]:
     nets = []
-    for m in re.finditer(r"(?:NET\s+)?([A-Za-z0-9_\-]+)\s*\((.*?)\)\s*;", text, re.S | re.I):
-        name = m.group(1)
-        body = m.group(2)
-        tokens = re.split(r"[\s,]+", body.strip())
-        pins = []
-        for tok in tokens:
-            tok = tok.strip().rstrip(';,')
-            if not tok:
+    # Find NETWORK ... ENDNETWORK blocks
+    net_sec = re.compile(r"NETWORK\s*;(.*?)(?:ENDNETWORK\s*;)", re.S | re.I)
+    for sec in net_sec.finditer(text):
+        body = sec.group(1)
+        for ln in body.splitlines():
+            ln = ln.strip()
+            if not ln:
                 continue
-            if '.' in tok:
-                inst, pin = tok.split('.', 1)
-                pins.append({"instance": inst, "pin": pin})
-            else:
-                pins.append({"instance": tok, "pin": ""})
-        nets.append({"name": name, "pins": pins})
+            if ln.startswith('//') or ln.startswith('*'):
+                continue
+            toks = re.split(r"\s+", ln)
+            if not toks:
+                continue
+            # Many connectivity lines start with C_x or similar; accept those
+            if not toks[0].startswith('C_'):
+                continue
+            net_name = toks[0]
+            pins = []
+            for tok in toks[1:]:
+                tok_clean = tok.rstrip(',;')
+                # skip numeric tokens
+                if re.match(r"^[0-9.-]+$", tok_clean):
+                    continue
+                # skip power/net keywords
+                if tok_clean.upper() in {'GND','VDD','POW','VSS','P2G','P2F','P1G','P1F','DIR'}:
+                    continue
+                if tok_clean in instance_names:
+                    pins.append({"instance": tok_clean, "pin": ""})
+                else:
+                    # treat as pin label if not an instance
+                    pins.append({"instance": "", "pin": tok_clean})
+            if pins:
+                nets.append({"name": net_name, "pins": pins})
     return nets
 
 
@@ -98,8 +124,28 @@ def parse_yal(path: str) -> Dict[str, Any]:
         text = f.read()
     text = remove_comments(text)
     modules = parse_modules(text)
-    nets = parse_nets(text)
+    instance_names = {m['name'] for m in modules}
+    nets = parse_networks(text, instance_names)
 
+    # Fallback: if no NETWORK nets, also try NET(...) style
+    if not nets:
+        for m in re.finditer(r"(?:NET\s+)?([A-Za-z0-9_\-]+)\s*\((.*?)\)\s*;", text, re.S | re.I):
+            name = m.group(1)
+            body = m.group(2)
+            tokens = re.split(r"[\s,]+", body.strip())
+            pins = []
+            for tok in tokens:
+                tok = tok.strip().rstrip(';,')
+                if not tok:
+                    continue
+                if '.' in tok:
+                    inst, pin = tok.split('.', 1)
+                    pins.append({"instance": inst, "pin": pin})
+                else:
+                    pins.append({"instance": tok, "pin": ""})
+            nets.append({"name": name, "pins": pins})
+
+    # If modules empty but nets present, infer instances
     if not modules and nets:
         seen = set()
         for net in nets:
